@@ -6,6 +6,7 @@ This repository contains the implementation of speculative decoding for the Sail
 
 Suppose you save the weights in file_name.
 ```python
+from transformers import AutoTokenizer
 from glide_sailor import Qwen2Glide
 tokenizer = AutoTokenizer.from_pretrained(file_name)
 model = Qwen2Glide.from_pretrained(file_name, torch_dtype=torch.bfloat16, device_map="auto")
