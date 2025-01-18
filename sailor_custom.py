@@ -19,15 +19,12 @@ from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2MLP,
     Qwen2RMSNorm,
     Qwen2RotaryEmbedding,
+    Qwen2PreTrainedModel,
     apply_rotary_pos_emb,
 )
 
 
 logger = logging.get_logger(__name__)
-
-
-_CHECKPOINT_FOR_DOC = "Qwen/Qwen2-7B-beta"
-_CONFIG_FOR_DOC = "Qwen2Config"
 
 
 class Qwen2Attention(nn.Module):
@@ -80,16 +77,13 @@ class Qwen2Attention(nn.Module):
         self.softmax_scale = 1 / (128 ** 0.5)
         self.range_indices = None
 
-
     def forward(
         self,
         hidden_states,
         position_embeddings,
         cache_lens=None,
-        flex_attn=None,
         tree_mask=None,
         exec_type="training",
-        induction_head=False,
     ):
         
         kv_cache = None
@@ -194,9 +188,6 @@ class Qwen2Attention(nn.Module):
             cache_lens,
             tree_mask=None,
             ):
-        '''
-        tree_mask: bsz fseq fseq (flatten_seqlen)
-        '''
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states)
@@ -209,8 +200,6 @@ class Qwen2Attention(nn.Module):
         
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, unsqueeze_dim=1)
-
-        # self.batch_indices # torch.arange(1024, device=K_cache.device)
 
         if tree_mask is None:
             assert q_len == 1, "You are in the first step of tree decoding, thus you should not input qlen > 2 without tree mask"
@@ -225,7 +214,7 @@ class Qwen2Attention(nn.Module):
 
         else:
             _, current_kv_len, all_kv_len = tree_mask.size()
-            range_indices = cache_lens.unsqueeze(-1) + self.range_indices[:all_kv_len].unsqueeze(0)  # 计算范围
+            range_indices = cache_lens.unsqueeze(-1) + self.range_indices[:all_kv_len].unsqueeze(0)
             bsz_indices = self.range_indices[:bsz].unsqueeze(-1)
             self.K_Cache[bsz_indices, :, range_indices, :] = key_states.permute(0, 2, 1, 3)
             self.V_Cache[bsz_indices, :, range_indices, :] = value_states.permute(0, 2, 1, 3)
@@ -267,12 +256,10 @@ class Qwen2DecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states,
-        position_embeddings,  # will become mandatory in v4.46
+        position_embeddings,
         cache_lens=None,
-        flex_attn=None,
         exec_type=None,
         tree_mask=None,
-        induction_head=False,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
 
         residual = hidden_states
@@ -284,10 +271,8 @@ class Qwen2DecoderLayer(nn.Module):
             hidden_states=hidden_states,
             position_embeddings=position_embeddings,
             cache_lens=cache_lens,
-            flex_attn=flex_attn,
             exec_type=exec_type,
             tree_mask=tree_mask,
-            induction_head=induction_head,
         )
         hidden_states = residual + hidden_states
 
@@ -301,36 +286,8 @@ class Qwen2DecoderLayer(nn.Module):
 
         return outputs
 
-class Qwen2PreTrainedModel(PreTrainedModel):
-    config_class = Qwen2Config
-    base_model_prefix = "model"
-    supports_gradient_checkpointing = True
-    _no_split_modules = ["Qwen2DecoderLayer"]
-    _skip_keys_device_placement = "past_key_values"
-    _supports_flash_attn_2 = True
-    _supports_sdpa = True
-    _supports_cache_class = True
-    _supports_quantized_cache = True
-    _supports_static_cache = True
-
-    def _init_weights(self, module):
-        std = self.config.initializer_range
-        if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
 
 class Qwen2Model(Qwen2PreTrainedModel):
-    """
-    Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`Qwen2DecoderLayer`]
-
-    Args:
-        config: Qwen2Config
-    """
 
     def __init__(self, config: Qwen2Config):
         super().__init__(config)
@@ -362,10 +319,8 @@ class Qwen2Model(Qwen2PreTrainedModel):
         position_ids=None,
         inputs_embeds=None,
         cache_lens=None,
-        flex_attn=None,
         exec_type=None,
         tree_mask=None,
-        induction_head=False,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         if position_ids is None:
             if tree_mask is None:
@@ -391,20 +346,16 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     hidden_states,
                     position_embeddings,
                     cache_lens,
-                    flex_attn,
                     exec_type,
                     tree_mask,
-                    induction_head,
                 )
             else:
                 layer_outputs = decoder_layer(
                     hidden_states,
                     position_embeddings,
                     cache_lens,
-                    flex_attn,
                     exec_type,
                     tree_mask,
-                    induction_head,
                 )
 
             hidden_states = layer_outputs[0]
@@ -471,35 +422,14 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         labels=None,
         cache_lens=None,
         exec_type="training",
-        induction_head=False,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         
-        if exec_type == "free_training":
-
-            bsz, seqlen = position_ids.size()
-            eod_mask = position_ids.eq(self.eod)
-            eod_indices = torch.nonzero(eod_mask, as_tuple=False)
-
-
-            assert eod_indices.size(0) == bsz * self.sample_num, "dataset needs all batch samples have same output samples equasl to self.sample_num"
-
-            eod_col = eod_indices[:, 1].view(bsz, 10)
-            prefix_end, doc_end = eod_col[:, 0], eod_col[:, 1:]
-            # block_mask = construct_doc_mask(bsz, prefix_end, doc_end, seqlen)
-            # block_mask = create_block_mask(construct_doc_mask, B=None, H=None, Q_LEN=8192, KV_LEN=8192, _compile=True)
-            # flex_attn = torch.compile(partial(flex_attention, block_mask=block_mask, enable_gqa=True))
-            flex_attn = None
-        else:
-            flex_attn = None
-
         outputs = self.model(
             input_ids=input_ids,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             cache_lens=cache_lens,
-            flex_attn=flex_attn,
             exec_type=exec_type,
-            induction_head=induction_head,
         )
 
         hidden_states = outputs[0]

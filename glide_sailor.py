@@ -4,7 +4,7 @@ import time
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
-from .sailor_custom import Qwen2ForCausalLM
+from sailor_custom import Qwen2ForCausalLM
 from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2MLP,
     Qwen2RMSNorm,
@@ -13,7 +13,7 @@ from transformers.models.qwen2.modeling_qwen2 import (
 )
 from dataclasses import dataclass
 from transformers.utils import ModelOutput
-from models.mixin import PretrainedModelParallelPreSplitMixin
+# from models.mixin import PretrainedModelParallelPreSplitMixin
 from torch import nn
 from torch.nn.attention.flex_attention import create_block_mask
 
@@ -58,21 +58,15 @@ class GlideAttention(nn.Module):
         self.V_Cache = None
         self.answer_K_Cache = None
         self.answer_V_Cache = None
-        self.max_len = 512
         self.prefix_lens = None
         self.layer_idx = layer_idx
         self.softmax_scale = 1 / (self.head_dim ** 0.5)
-        self.range_indices = torch.arange(1024)
-        
-        self.set_torch_mask()
 
-    def set_flex_attn(self, seqlen):
-        def block_mask(b, h, q_idx, kv_idx):
-            q_block = q_idx // 4
-            kv_block = kv_idx // 4
-            return q_block > kv_block
-        mask = create_block_mask(block_mask, B=None, H=None, Q_LEN=seqlen, KV_LEN=seqlen,  _compile=True)
-        return mask
+        # These two variables will be reset by Qwen2GlideDecoderLayer when using `generate` function
+        self.max_len = 512  
+        self.range_indices = torch.arange(self.max_len)
+
+        self.set_torch_mask()
     
     def set_torch_mask(self, max_len=4096, block_size=4):
         q_idx = torch.arange(max_len).view(-1, 1)
@@ -132,16 +126,13 @@ class GlideAttention(nn.Module):
         cos, sin = position_embeddings
         query_states, _ = apply_rotary_pos_emb(query_states, query_states, cos, sin, unsqueeze_dim=1)
 
-        # mask = self.set_flex_attn(q_len)
         key_states = key_states.repeat_interleave(self.num_key_value_groups, dim=1)
         value_states = value_states.repeat_interleave(self.num_key_value_groups, dim=1)
-        # qwen not supportted by flex attn due to group num
         mask = self.torch_mask[None, None, :q_len, :q_len]
         scores = torch.matmul(query_states, key_states.transpose(3, 2)) / (key_states.size(-1) ** 0.5)
         scores = scores.masked_fill(~mask, float('-inf'))
         attn_weights = F.softmax(scores.float(), dim=-1)
         attn_output = torch.matmul(attn_weights.to(value_states.dtype), value_states)
-        # attn_output = self.flex_attn(query_states, key_states, value_states, block_mask=mask)
         attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, self.hidden_size)
 
         attn_output = self.o_proj(attn_output)
@@ -337,12 +328,11 @@ class Qwen2GlideDecoderLayer(nn.Module):
         self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_self_attention_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_cross_attention_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self._init_weights
         self.config = config
-        # self.apply(self._init_weights)
     
     def set_max_gen_len(self, max_gen_len):
         self.self_attn.max_len = max_gen_len
+        self.self_attn.range_indices = torch.arange(max_gen_len)
     
     def _init_weights(self, module):
         std = self.config.initializer_range
@@ -402,7 +392,7 @@ class Qwen2GlideDecoderLayer(nn.Module):
         return hidden_states
 
 
-class Qwen2Glide(PretrainedModelParallelPreSplitMixin, Qwen2ForCausalLM):
+class Qwen2Glide(Qwen2ForCausalLM):
     def __init__(self, config):
         super().__init__(config)
         self.glide = Qwen2GlideDecoderLayer(config, layer_idx=0)
@@ -415,17 +405,9 @@ class Qwen2Glide(PretrainedModelParallelPreSplitMixin, Qwen2ForCausalLM):
         for param in self.glide.parameters():
             param.requires_grad = True
         self.post_init()
-        
-    def compute_fused_loss(self, hidden_states, labels):
-        from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
-        loss_fn = LigerFusedLinearCrossEntropyLoss()
-        hidden_dim = hidden_states.size(-1)
-        loss = loss_fn(self.lm_head.weight, hidden_states[:, :-1].reshape(-1, hidden_dim), labels[:, 1:].reshape(-1))
-        return loss
     
     def compute_loss(self, hidden_states, labels):
         logits = self.lm_head(hidden_states).float()
-        # from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
         loss_fn = torch.nn.CrossEntropyLoss()
         loss = loss_fn(logits[:, :-1].reshape(-1, logits.size(-1)), labels[:, 1:].reshape(-1))
         return loss
@@ -494,8 +476,8 @@ class Qwen2Glide(PretrainedModelParallelPreSplitMixin, Qwen2ForCausalLM):
     def spec_generate(self, input_ids, max_gen_len=64, eos_id=151645, gamma=4):
         assert input_ids != None, "please give the input"
         bsz = input_ids.size(0)
-        output_ids = input_ids.new_zeros((bsz, max_gen_len + gamma))
-        spec_mask = input_ids.new_zeros((bsz, max_gen_len + gamma))
+        output_ids = input_ids.new_zeros((bsz, max_gen_len + gamma + 2))
+        spec_mask = input_ids.new_zeros((bsz, max_gen_len + gamma + 2))
         
         self.set_max_gen_len(max_gen_len + 128)
         self.glide.set_max_gen_len(max_gen_len + 128)
@@ -552,15 +534,12 @@ class Qwen2Glide(PretrainedModelParallelPreSplitMixin, Qwen2ForCausalLM):
                 if double_flag and (spec_steps == 0):
                     # double batch id, if double accept, then gather the -1 token, else, gather the -2 token.
                     draft_cache_lens += 1 + double_input
-                    spec_buffer[:, spec_steps + 1] = self.lm_head(hidden_states[:, -2:, :]).argmax(dim=-1)[range(bsz), double_input]
+                    current_logp = self.lm_head(hidden_states[:, -2:, :])
+                    spec_buffer[:, spec_steps + 1] = current_logp.argmax(dim=-1)[range(bsz), double_input]
                 else:
                     draft_cache_lens += 1
-                    spec_buffer[:, spec_steps + 1] = self.lm_head(hidden_states[:, -1, :]).argmax(dim=-1).view(-1,)
-            
-            # every time, for the input ids goes into LLM, the size should be gamma + 1
-            # because, the first one is bonus token, always correct but no kv cache in LLM
-            # and the rest are spec tokens by small LM.
-            # spec_buffer = spec_buffer[:, :-1] # the last token is padding token, do not need for verification
+                    current_logp = self.lm_head(hidden_states[:, -1, :])
+                    spec_buffer[:, spec_steps + 1] = current_logp.argmax(dim=-1).view(-1,)
 
             hidden_states = self.model.forward(spec_buffer, cache_lens=cache_lens.clone(), exec_type="decoding").last_hidden_state
             llm_verify_output = self.lm_head(hidden_states[:, -gamma - 1:, :]).argmax(dim=-1)
@@ -589,14 +568,11 @@ class Qwen2Glide(PretrainedModelParallelPreSplitMixin, Qwen2ForCausalLM):
                 #         next_spec_start_token[i, 0] = llm_verify_output[i, correct_len[i] - 1]
                 next_spec_start_token[:, 0] = llm_verify_output[range(bsz), correct_len - 2]
                 next_spec_start_token[:, 1] = llm_verify_output[range(bsz), correct_len - 1]
-                next_spec_start_token[:, 0] = (1 - double_input.int()) * next_spec_start_token[:, 1]
-
+                next_spec_start_token[:, 0] = (1 - double_input.int()) * next_spec_start_token[:, 1] + double_input.int() * next_spec_start_token[:, 0]   
             else:
                 next_spec_start_token[:, 0] = bonus_token
-            
-            spec_buffer[:, 0] = bonus_token
-            # cachelen cannot exceed gamma, because draft model does not have the last kv of its last output
-            
+
+            spec_buffer[:, 0] = bonus_token            
             correct_len = correct_len.clamp(max=gamma)
             draft_cache_lens = cache_lens - double_input
 
@@ -605,4 +581,4 @@ class Qwen2Glide(PretrainedModelParallelPreSplitMixin, Qwen2ForCausalLM):
             if (output_ids.eq(eos_id)).any():
                 break
 
-        return output_ids
+        return output_ids[:, :max_gen_len]
