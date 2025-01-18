@@ -1,6 +1,5 @@
 from typing import Optional
 
-import time
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
@@ -13,9 +12,7 @@ from transformers.models.qwen2.modeling_qwen2 import (
 )
 from dataclasses import dataclass
 from transformers.utils import ModelOutput
-# from models.mixin import PretrainedModelParallelPreSplitMixin
 from torch import nn
-from torch.nn.attention.flex_attention import create_block_mask
 
 @dataclass
 class CausalLMOutputWithPast(ModelOutput):
